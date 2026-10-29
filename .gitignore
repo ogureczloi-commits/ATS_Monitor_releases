@@ -21,7 +21,7 @@ dist/
 dist_*/
 updater_build*/
 updater_dist*/
-ATS_Monitor_v*.zip
+ATS_Monitor*.zip
 *.exe
 *.pkg
 
@@ -32,6 +32,7 @@ ats_monitor_ui — копия.py
 ats_monitor_ui — копия (2).py
 ats_monitor_ui.pre_*.py
 ATS_Monitor_v1.2.0_py312/
+dist — копия/
 ESP/
 updater_build/
 updater_build_v2/
