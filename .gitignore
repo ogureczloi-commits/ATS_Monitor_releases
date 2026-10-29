@@ -1,0 +1,45 @@
+# Local configuration and secrets
+ats_monitor_local_config.json
+openweather_api_key.txt
+esp_last_ip.txt
+.env
+.env.*
+*token*
+*secret*
+*password*
+
+# Python environments and caches
+venv/
+venv312/
+__pycache__/
+*.py[cod]
+
+# Build and release artifacts
+build/
+build_*/
+dist/
+dist_*/
+updater_build*/
+updater_dist*/
+ATS_Monitor_v*.zip
+*.exe
+*.pkg
+
+# Historical source copies and previous application versions
+ats_monitor.py
+ATS_Monitor.spec
+ats_monitor_ui — копия.py
+ats_monitor_ui — копия (2).py
+ats_monitor_ui.pre_*.py
+ATS_Monitor_v1.2.0_py312/
+ESP/
+updater_build/
+updater_build_v2/
+updater_dist/
+updater_dist_v2/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
