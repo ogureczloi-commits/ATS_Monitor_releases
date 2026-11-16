@@ -113,6 +113,8 @@ def safe_remove(path):
 LOCAL_STATE_FILES = {
     'openweather_api_key.txt',
     'esp_last_ip.txt',
+    'ats_monitor_local_config.json',
+    'fan_endpoint.txt',
     'update_error.txt',
 }
 

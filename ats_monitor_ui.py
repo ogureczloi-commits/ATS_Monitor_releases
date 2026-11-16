@@ -16,6 +16,8 @@ import shutil
 import webbrowser
 import concurrent.futures
 import queue
+import json
+import math
 import cv2
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -33,6 +35,7 @@ from collections import deque
 
 import matplotlib.pyplot as plt
 from ats_monitor_local_config import load_local_config, config_value
+from fan_controller import FanClient, normalize_endpoint, status_settings, parse_settings_form
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = sys._MEIPASS
@@ -45,12 +48,12 @@ else:
 # ================= НАСТРОЙКИ =================
 
 APP_NAME = "ATS Monitor"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.5.0"
 UPDATE_REPO = "ogureczloi-commits/ATS_Monitor_releases"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_CHECK_INTERVAL = 24 * 60 * 60
 
-ESP_CONFIG = os.path.join(BASE_DIR, "esp_last_ip.txt")
+ESP_CONFIG = os.path.join(USER_DATA_DIR, "esp_last_ip.txt")
 ESP_URL = None
 ESP_IP = None
 REFRESH_SEC = 5
@@ -80,32 +83,12 @@ CAMERAS = {
 CURRENT_RTSP = ""  # сюда будет записываться выбранный/введённый RTSP
 
 
-# OpenWeatherMap работает из РФ. Ключ хранится локально рядом с EXE,
-# чтобы не попадать в исходный код, репозиторий и архивы обновлений.
-WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
-WEATHER_API_KEY_FILE = os.path.join(USER_DATA_DIR, "openweather_api_key.txt")
-WEATHER_PARAMS = {
-    "lat": 55.75,
-    "lon": 37.62,
-    "units": "metric",
-    "lang": "ru",
-}
-
-
-def load_weather_api_key():
-    try:
-        with open(WEATHER_API_KEY_FILE, "r", encoding="utf-8") as key_file:
-            return key_file.read().strip()
-    except OSError:
-        return ""
-
 MAX_POINTS = 60
 temp_history = deque(maxlen=MAX_POINTS)
 hum_history  = deque(maxlen=MAX_POINTS)
 
 # ================= ДАННЫЕ =================
 
-last_weather_update = 0
 outside_temp = None
 season_mode = "—"
 
@@ -140,6 +123,46 @@ def probe_esp_ip(ip, timeout=ESP_SCAN_TIMEOUT):
     except Exception:
         pass
     return None
+
+
+def probe_esp_devices(address, timeout=ESP_SCAN_TIMEOUT):
+    """Identify each independent device only from its own status contract."""
+    found = []
+    sensor = probe_esp_ip(address, timeout=timeout)
+    if sensor:
+        found.append(('sensor', str(address)))
+    try:
+        status = FanClient(address, timeout=timeout).status()
+        if isinstance(status.get('room_valid'), bool) and isinstance(status.get('outdoor_valid'), bool):
+            found.append(('fan', str(address)))
+    except Exception:
+        pass
+    return found
+
+
+def scan_for_devices(progress_cb=None, stop_event=None, fan_endpoint=''):
+    candidates = build_scan_candidates()
+    if fan_endpoint:
+        from urllib.parse import urlsplit
+        host = urlsplit(normalize_endpoint(fan_endpoint)).netloc
+        if host and host not in candidates:
+            candidates.insert(0, host)
+    found = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=ESP_SCAN_WORKERS) as executor:
+        futures = {executor.submit(probe_esp_devices, ip, ESP_SCAN_TIMEOUT): ip for ip in candidates}
+        for done, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            if stop_event and stop_event.is_set():
+                executor.shutdown(wait=False, cancel_futures=True)
+                return found
+            ip = futures[future]
+            try:
+                devices = future.result()
+            except Exception:
+                devices = []
+            found.extend(devices)
+            if progress_cb:
+                progress_cb(done, len(candidates), ip, devices)
+    return found
 
 
 def resolve_hostname(name):
@@ -239,6 +262,23 @@ def set_esp_ip(ip):
     ESP_URL = f"http://{ESP_IP}/status" if ESP_IP else None
 
 
+def validated_esp(data):
+    if not is_esp_status(data):
+        return None
+    result = dict(data)
+    try:
+        for key in ('room_temp', 'humidity', 'pressure'):
+            value = data.get(key, 0)
+            if isinstance(value, bool):
+                return None
+            result[key] = float(value)
+            if not math.isfinite(result[key]):
+                return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result
+
+
 def get_esp_data():
     if not ESP_URL:
         return None
@@ -247,7 +287,7 @@ def get_esp_data():
         if r.status_code == 200:
             data = r.json()
             if is_esp_status(data):
-                return data
+                return validated_esp(data)
     except Exception:
         pass
     return None
@@ -260,29 +300,39 @@ class CameraReader:
         self._stop = threading.Event()
         self._frame = None
         self._opened = False
+        self._frame_at = 0.0
         self._thread = threading.Thread(target=self._run, args=(rtsp_url,), daemon=True)
         self._thread.start()
 
     def _run(self, rtsp_url):
-        cap = cv2.VideoCapture(rtsp_url)
-        with self._lock:
-            self._opened = cap.isOpened()
-        try:
-            while not self._stop.is_set() and cap.isOpened():
-                ok, frame = cap.read()
-                if ok and frame is not None:
+        while not self._stop.is_set():
+            cap = None
+            try:
+                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG, [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000])
+                with self._lock:
+                    self._opened = cap.isOpened()
+                while not self._stop.is_set() and cap.isOpened():
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        break
                     with self._lock:
                         self._frame = frame
-                else:
-                    self._stop.wait(0.08)
-        finally:
-            cap.release()
-            with self._lock:
-                self._opened = False
+                        self._frame_at = time.monotonic()
+            except Exception:
+                pass
+            finally:
+                if cap is not None:
+                    cap.release()
+                with self._lock:
+                    self._opened = False
+                    self._frame = None
+            self._stop.wait(2)
 
     def latest_frame(self):
         with self._lock:
-            return None if self._frame is None else self._frame.copy()
+            return None if self._frame is None or time.monotonic() - self._frame_at > 5 else self._frame.copy()
 
     def is_opened(self):
         with self._lock:
@@ -292,23 +342,19 @@ class CameraReader:
         self._stop.set()
 
 
-# ================= ПОГОДА =================
+# ================= УЛИЧНЫЙ ДАТЧИК ВЕНТИЛЯТОРА =================
 
-def get_outside_temp():
-    api_key = load_weather_api_key()
-    if not api_key:
+def outdoor_from_fan(status):
+    if not isinstance(status, dict) or status.get('online') is not True or status.get('outdoor_valid') is not True:
         return None
-    try:
-        params = {**WEATHER_PARAMS, "appid": api_key}
-        response = requests.get(WEATHER_URL, params=params, timeout=8)
-        response.raise_for_status()
-        return response.json()["main"]["temp"]
-    except (requests.RequestException, KeyError, TypeError, ValueError):
+    value = status.get('outdoor_c')
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not -55 <= value <= 125:
         return None
+    return value
 
 def detect_season(out_temp, prev):
     if out_temp is None:
-        return prev
+        return "—"
     if out_temp < 10:
         return "ЗИМА"
     if out_temp > 15:
@@ -317,9 +363,7 @@ def detect_season(out_temp, prev):
 
 
 def check_alerts(room_temp, outside_temp, door_open, season):
-    global door_open_since
-
-    if season == "ЗИМА" and outside_temp is not None:
+    if season == "ЗИМА" and outside_temp is not None and room_temp is not None and door_open is not None:
         if outside_temp < 0 and room_temp > 23 and not door_open:
             alert_manager.show(
                 "winter_vent",
@@ -328,10 +372,12 @@ def check_alerts(room_temp, outside_temp, door_open, season):
             )
         else:
             alert_manager.clear("winter_vent")
+    else:
+        alert_manager.clear("winter_vent")
 
 
     # ☀️ ЛЕТО — дверь открыта долго
-    if season == "ЛЕТО":
+    if season == "ЛЕТО" and outside_temp is not None and door_open is not None:
         if door_open:
             alert_manager.show(
                 "door_summer",
@@ -340,6 +386,8 @@ def check_alerts(room_temp, outside_temp, door_open, season):
             )
         else:
             alert_manager.clear("door_summer")
+    else:
+        alert_manager.clear("door_summer")
 
 
 def tray_show(icon, item):
@@ -357,7 +405,7 @@ def get_db_conn():
         port=DB_PORT,
         dbname=DB_NAME,
         user=DB_USER,
-        password=DB_PASS
+        password=DB_PASS, connect_timeout=5, options="-c statement_timeout=5000"
     )
 
 def log_esp_data(cursor, temp, hum, press, door, online, esp_id="ATS_1"):
@@ -417,11 +465,26 @@ class ATSApp(ctk.CTk):
         self._closing = False
         self._after_ids = set()
         self._ui_queue = queue.Queue()
+        self.fan_endpoint_file = os.path.join(os.environ.get("LOCALAPPDATA", USER_DATA_DIR), "ATS_Monitor", "fan_endpoint.txt")
+        try:
+            with open(self.fan_endpoint_file, encoding="utf-8") as f:
+                self.fan_endpoint = normalize_endpoint(f.read())
+        except (OSError, ValueError):
+            self.fan_endpoint = ""
+        self.fan_status = None
+        self._fan_last_poll_at = 0.0
+        self._fan_busy = False
+        self._fan_generation = 0
+        self._fan_angle = 0.0
         # БД подключается после отрисовки окна, чтобы недоступная сеть не подвешивала запуск.
         self.db_conn = None
         self.db_cursor = None
         self.db_connecting = False
         self.db_lock = threading.Lock()
+        self._db_log_busy = False
+        self._db_log_queue = queue.Queue()
+        self._db_log_lock = threading.Lock()
+        self._db_enabled = bool(DB_HOST and DB_NAME and DB_USER)
         self.last_logged = 0
         self.LOG_INTERVAL = 30  # писать раз в 30 сек
 
@@ -448,6 +511,8 @@ class ATSApp(ctk.CTk):
         top_buttons.pack(side="right", padx=12, pady=10)
         button_options = dict(height=30, corner_radius=8, font=ctk.CTkFont(family=FONT_FAMILY, size=12))
         ctk.CTkButton(top_buttons, text="ESP", command=self.open_esp_selector, width=58,
+                      fg_color=COLOR_CARD_ALT, hover_color=COLOR_BORDER, text_color=COLOR_TEXT, **button_options).pack(side="left", padx=2)
+        ctk.CTkButton(top_buttons, text="Вентиляция", command=self.open_fan_settings, width=92,
                       fg_color=COLOR_CARD_ALT, hover_color=COLOR_BORDER, text_color=COLOR_TEXT, **button_options).pack(side="left", padx=2)
         ctk.CTkButton(top_buttons, text="Камера", command=self.open_camera_settings, width=70,
                       fg_color=COLOR_CARD_ALT, hover_color=COLOR_BORDER, text_color=COLOR_TEXT, **button_options).pack(side="left", padx=2)
@@ -556,7 +621,6 @@ class ATSApp(ctk.CTk):
         self._esp_refresh_running = False
         self._latest_esp = None
         self._latest_esp_at = 0.0
-        self._weather_refresh_running = False
 
         # ===== Мелкий статус обновления =====
         self.update_label = ctk.CTkLabel(
@@ -568,31 +632,354 @@ class ATSApp(ctk.CTk):
         self.update_label.grid(row=2, column=1, sticky="e", padx=20)
 
         self.schedule_after(100, self.drain_ui_queue)
-        self.schedule_after(300, self.connect_database_async)
         self.schedule_after(1000, self.loop)
+        self.schedule_after(500, self.poll_fan)
         self.schedule_after(3000, lambda: self.check_for_updates(manual=False))
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
-    def connect_database_async(self):
-        """Подключает журнал БД вне UI-потока; мониторинг остаётся доступным без БД."""
-        if self._closing or self.db_conn or self.db_connecting:
+    def fan_request(self, operation, done=None):
+        if self._fan_busy or not self.fan_endpoint:
+            if done:
+                done(False, "Нет адреса или запрос уже выполняется")
             return
-        self.db_connecting = True
+        self._fan_busy = True
+        endpoint, generation = self.fan_endpoint, self._fan_generation
 
         def worker():
             try:
-                conn = get_db_conn()
-                cursor = conn.cursor()
+                result = operation(FanClient(endpoint))
+                error = None
             except Exception as exc:
-                print("DB connection error:", exc)
-                conn = cursor = None
+                result, error = None, str(exc)
+            completed_at = time.monotonic()
 
-            def apply_connection():
-                self.db_connecting = False
-                if conn is not None:
-                    self.db_conn, self.db_cursor = conn, cursor
-            self.safe_after_from_worker(apply_connection)
+            def apply():
+                self._fan_busy = False
+                if generation != self._fan_generation:
+                    return
+                if error is None and isinstance(result, dict) and result.get('online'):
+                    self._fan_last_poll_at = completed_at
+                if done:
+                    done(error is None, result if error is None else error)
+            self.safe_after_from_worker(apply)
+        threading.Thread(target=worker, daemon=True).start()
 
+    def poll_fan(self):
+        now = time.monotonic()
+        if self.fan_status and (not self._fan_last_poll_at or now - self._fan_last_poll_at > 12):
+            self.fan_status = None
+            self.update_fan_dialog()
+        if self.fan_endpoint and not self._fan_busy and now >= getattr(self, '_fan_next_poll_at', 0):
+            self._fan_next_poll_at = now + 2
+            def complete(ok, result):
+                # Leave breathing room after slow responses and failures too.
+                self._fan_next_poll_at = time.monotonic() + 2
+                if ok:
+                    self.fan_status = result if result.get('online') and time.monotonic() - self._fan_last_poll_at <= 12 else None
+                elif not self._fan_last_poll_at or time.monotonic() - self._fan_last_poll_at > 12:
+                    self.fan_status = None
+                self.update_fan_dialog()
+            self.fan_request(lambda client: client.status(), complete)
+        self.schedule_after(250, self.poll_fan)
+
+    def animate_fan(self, gadget):
+        if self.gadget is not gadget or not gadget.winfo_exists():
+            return
+        status = self.fan_status
+        speed = status['output_speed'] if status else 0
+        now = time.monotonic()
+        previous = getattr(self, '_fan_animation_at', now)
+        self._fan_animation_at = now
+        self._fan_angle = (self._fan_angle + speed * 0.05 * max(0, now - previous)) % (2 * math.pi)
+        canvas = self.fan_canvas
+        canvas.delete('all')
+        # Original vector artwork: a shrouded, three-blade axial fan.
+        canvas.create_oval(1, 1, 41, 41, fill='#edf3fa', outline='#cbd9e8', width=1)
+        canvas.create_oval(4, 4, 38, 38, fill='#f8fbff', outline='#dce7f2', width=1)
+
+        def blades(angle, color):
+            for i in range(3):
+                a = angle + i * 2 * math.pi / 3
+                points = []
+                for radius, offset in ((3, -0.48), (9, -0.62), (16, -0.38),
+                                       (17, 0.10), (14, 0.46), (8, 0.40), (3, 0.25)):
+                    points.extend((21 + radius * math.cos(a + offset),
+                                   21 + radius * math.sin(a + offset)))
+                canvas.create_polygon(*points, fill=color, outline='', smooth=True, splinesteps=18)
+
+        # Pale angular echoes suggest motion, not measured RPM.
+        if speed > 0:
+            blades(self._fan_angle - min(0.52, 0.12 + speed * 0.004), '#e1eefb')
+            blades(self._fan_angle - min(0.30, 0.06 + speed * 0.002), '#bcdcf6')
+        blades(self._fan_angle, '#438fd0' if status else '#a6b5c4')
+        canvas.create_oval(17, 17, 25, 25, fill='#f8fbff', outline='#91adc6', width=1)
+        canvas.create_oval(19, 19, 23, 23, fill='#79a8cf' if status else '#a6b5c4', outline='')
+        # CTkCanvas uses physical pixels, unlike CTk widgets; scale the artwork
+        # to its actual requested size so it stays crisp at Windows DPI scales.
+        scale = canvas.winfo_reqwidth() / 42
+        canvas.scale('all', 0, 0, scale, scale)
+        self.fan_gadget_label.configure(text=(f"Вентиляция: {speed:g}%\n{'Автоматический' if status['mode'] == 'auto' else 'Ручной'} режим" if status else "Вентиляция\nНет связи"))
+        self.schedule_after(33, lambda: self.animate_fan(gadget))
+
+    def update_fan_dialog(self):
+        window = getattr(self, '_fan_window', None)
+        if not window or not window.winfo_exists():
+            return
+        status = self.fan_status
+        if status:
+            room = f"{status['room_c']:.1f} °C" if status.get('room_valid') and isinstance(status.get('room_c'), (int, float)) and math.isfinite(status['room_c']) else 'нет данных'
+            outdoor = f"{status['outdoor_c']:.1f} °C" if status.get('outdoor_valid') and isinstance(status.get('outdoor_c'), (int, float)) and math.isfinite(status['outdoor_c']) else 'нет данных'
+            self._fan_connection_label.configure(text='●  На связи', text_color=COLOR_SUCCESS)
+            if not status.get('alarm_known'):
+                alarm_text, alarm_color = 'Авария: неизвестно', COLOR_WARNING
+            elif status.get('alarm'):
+                alarm_text, alarm_color = '●  Авария', '#DC2626'
+            else:
+                alarm_text, alarm_color = '●  Аварии нет', COLOR_SUCCESS
+            self._fan_alarm_label.configure(text=alarm_text, text_color=alarm_color)
+            self._fan_output_label.configure(text=f"{status['output_speed']:g}%")
+            self._fan_current_mode_label.configure(text='Автоматический' if status['mode'] == 'auto' else 'Ручной')
+            self._fan_temperatures_label.configure(text=f'Помещение: {room}    ·    Улица: {outdoor}')
+            settings = status_settings(status)
+            if not self._fan_mode_initialized:
+                self._fan_mode.set('Ручной' if status['mode'] == 'manual' else 'Автоматический')
+                requested = status.get('requested_speed')
+                if isinstance(requested, (int, float)) and 0 <= requested <= 100:
+                    self._fan_speed.set(requested)
+                    self._fan_speed_label.configure(text=f'Ручная мощность: {int(requested)}%')
+                self._fan_mode_initialized = True
+            if len(settings) == len(self._fan_fields) and not self._fan_settings_dirty:
+                for key, entry in self._fan_fields.items():
+                    entry.delete(0, 'end')
+                    entry.insert(0, str(settings[key]))
+                self._fan_settings_baseline = settings.copy()
+            self._fan_settings_loaded = len(settings) == len(self._fan_fields)
+            self._fan_save_button.configure(state='normal' if self._fan_settings_loaded else 'disabled')
+        else:
+            self._fan_settings_loaded = False
+            self._fan_save_button.configure(state='disabled')
+            self._fan_connection_label.configure(text='●  Нет связи', text_color=COLOR_WARNING)
+            self._fan_alarm_label.configure(text='Авария: неизвестно', text_color=COLOR_MUTED)
+            self._fan_output_label.configure(text='—')
+            self._fan_current_mode_label.configure(text='Нет данных')
+            self._fan_temperatures_label.configure(text='Помещение: нет данных    ·    Улица: нет данных')
+
+    def open_fan_settings(self):
+        window = getattr(self, '_fan_window', None)
+        if window and window.winfo_exists():
+            window.deiconify()
+            window.lift()
+            window.focus_force()
+            return
+        window = ctk.CTkToplevel(self)
+        window.transient(self)
+        self._fan_window = window
+        self._fan_settings_loaded = False
+        self._fan_settings_dirty = False
+        self._fan_settings_baseline = {}
+        self._fan_mode_initialized = False
+        window.title('Вентилятор · настройки')
+        window.geometry('600x600')
+        window.minsize(520, 480)
+        window.configure(fg_color=COLOR_BG)
+        header = ctk.CTkFrame(window, fg_color=COLOR_SURFACE, corner_radius=0, height=58)
+        header.pack(fill='x')
+        header.pack_propagate(False)
+        ctk.CTkLabel(header, text='Вентилятор', text_color=COLOR_TEXT,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=18, weight='bold')).pack(side='left', padx=(18, 10))
+        ctk.CTkLabel(header, text='Состояние и управление', text_color=COLOR_MUTED,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=13)).pack(side='left')
+        body = ctk.CTkScrollableFrame(window, fg_color=COLOR_BG, corner_radius=0,
+                                      scrollbar_button_color=COLOR_BORDER, scrollbar_button_hover_color=COLOR_MUTED)
+        body.pack(fill='both', expand=True, padx=8, pady=(10, 8))
+        status_card = ctk.CTkFrame(body, fg_color=COLOR_CARD, corner_radius=14,
+                                   border_width=1, border_color=COLOR_BORDER)
+        status_card.pack(fill='x', padx=4, pady=(0, 10))
+        ctk.CTkLabel(status_card, text='Состояние контроллера', text_color=COLOR_MUTED,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight='bold')).pack(anchor='w', padx=18, pady=(14, 2))
+        control_card = ctk.CTkFrame(body, fg_color=COLOR_CARD, corner_radius=14,
+                                    border_width=1, border_color=COLOR_BORDER)
+        control_card.pack(fill='x', padx=4, pady=(0, 10))
+        ctk.CTkLabel(control_card, text='Управление', text_color=COLOR_MUTED,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight='bold')).pack(anchor='w', padx=18, pady=(14, 2))
+        ctk.CTkLabel(control_card, text='Заданная мощность, не измеренные обороты', text_color=COLOR_MUTED,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=12)).pack(anchor='w', padx=18, pady=(0, 7))
+        button_font = ctk.CTkFont(family=FONT_FAMILY, size=12)
+        field_font = ctk.CTkFont(family=FONT_FAMILY, size=12)
+        primary = dict(height=32, corner_radius=8, fg_color=COLOR_ACCENT,
+                       hover_color=COLOR_ACCENT_HOVER, font=button_font)
+        secondary = dict(height=32, corner_radius=8, fg_color=COLOR_CARD_ALT,
+                         hover_color=COLOR_BORDER, text_color=COLOR_TEXT, font=button_font)
+        entry_style = dict(height=34, fg_color=COLOR_CARD_ALT, border_color=COLOR_BORDER,
+                           text_color=COLOR_TEXT, font=field_font)
+        message = ctk.CTkLabel(control_card, text='', anchor='w', justify='left', wraplength=480,
+                               text_color=COLOR_WARNING, font=field_font)
+        def save_endpoint():
+            try:
+                value = normalize_endpoint(endpoint.get())
+                os.makedirs(os.path.dirname(self.fan_endpoint_file), exist_ok=True)
+                with open(self.fan_endpoint_file, 'w', encoding='utf-8') as f:
+                    f.write(value)
+            except (OSError, ValueError) as exc:
+                message.configure(text=f'Ошибка: {exc}')
+                return
+            self.fan_endpoint = value
+            self._fan_generation += 1
+            self.fan_status = None
+            self._fan_settings_loaded = False
+            self._fan_settings_dirty = False
+            self._fan_settings_baseline = {}
+            self._fan_mode_initialized = False
+            self.update_fan_dialog()
+            message.configure(text='Адрес сохранён; ожидание опроса')
+        status_line = ctk.CTkFrame(status_card, fg_color='transparent')
+        status_line.pack(fill='x', padx=18, pady=(2, 6))
+        self._fan_connection_label = ctk.CTkLabel(status_line, text='', font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight='bold'))
+        self._fan_connection_label.pack(side='left')
+        self._fan_alarm_label = ctk.CTkLabel(status_line, text='', font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight='bold'))
+        self._fan_alarm_label.pack(side='right')
+        metrics = ctk.CTkFrame(status_card, fg_color=COLOR_CARD_ALT, corner_radius=10)
+        metrics.pack(fill='x', padx=18, pady=(0, 4))
+        output = ctk.CTkFrame(metrics, fg_color='transparent')
+        output.pack(side='left', fill='x', expand=True, padx=12, pady=5)
+        ctk.CTkLabel(output, text='КОМАНДА ВЫХОДА', text_color=COLOR_MUTED, font=ctk.CTkFont(family=FONT_FAMILY, size=11)).pack(anchor='w')
+        self._fan_output_label = ctk.CTkLabel(output, text='—', text_color=COLOR_ACCENT, font=ctk.CTkFont(family=FONT_FAMILY, size=23, weight='bold'))
+        self._fan_output_label.pack(anchor='w')
+        current_mode = ctk.CTkFrame(metrics, fg_color='transparent')
+        current_mode.pack(side='left', fill='x', expand=True, padx=12, pady=5)
+        ctk.CTkLabel(current_mode, text='РЕЖИМ КОНТРОЛЛЕРА', text_color=COLOR_MUTED, font=ctk.CTkFont(family=FONT_FAMILY, size=11)).pack(anchor='w')
+        self._fan_current_mode_label = ctk.CTkLabel(current_mode, text='—', text_color=COLOR_TEXT, font=ctk.CTkFont(family=FONT_FAMILY, size=15, weight='bold'))
+        self._fan_current_mode_label.pack(anchor='w')
+        self._fan_temperatures_label = ctk.CTkLabel(status_card, text='', anchor='w', text_color=COLOR_MUTED, font=ctk.CTkFont(family=FONT_FAMILY, size=12))
+        self._fan_temperatures_label.pack(fill='x', padx=18, pady=(0, 10))
+        mode = ctk.CTkSegmentedButton(control_card, values=['Автоматический', 'Ручной'],
+                                      height=32, corner_radius=8, font=field_font,
+                                      fg_color=COLOR_CARD_ALT, selected_color='#BFDBFE',
+                                      selected_hover_color='#DBEAFE',
+                                      unselected_color=COLOR_CARD_ALT, unselected_hover_color=COLOR_BORDER,
+                                      text_color=COLOR_TEXT, text_color_disabled=COLOR_MUTED)
+        mode.set('Автоматический')
+        mode.pack(fill='x', padx=18, pady=3)
+        speed = ctk.CTkSlider(control_card, from_=0, to=100, number_of_steps=100,
+                              fg_color=COLOR_CARD_ALT, progress_color=COLOR_ACCENT,
+                              button_color=COLOR_ACCENT, button_hover_color=COLOR_ACCENT_HOVER)
+        speed.set(0)
+        speed_label = ctk.CTkLabel(control_card, text='Ручная мощность: 0%',
+                                   text_color=COLOR_TEXT, font=field_font)
+        self._fan_mode, self._fan_speed, self._fan_speed_label = mode, speed, speed_label
+        speed.configure(command=lambda value: speed_label.configure(text=f'Ручная мощность: {int(value)}%'))
+        speed_label.pack(anchor='w', padx=18, pady=(7, 0))
+        speed.pack(fill='x', padx=18, pady=(3, 10))
+        def complete(ok, result, saved=False):
+            self.fan_status = result if ok and result.get('online') and time.monotonic() - self._fan_last_poll_at <= 12 else None
+            if window.winfo_exists() and self._fan_window is window:
+                if saved and ok:
+                    self._fan_settings_dirty = False
+                message.configure(text='Состояние получено от контроллера' if ok else f'Ошибка: {result}')
+            self.update_fan_dialog()
+        def control():
+            selected_mode = 'manual' if mode.get() == 'Ручной' else 'auto'
+            value = int(round(speed.get())) if selected_mode == 'manual' else None
+            self.fan_request(lambda client: client.control(selected_mode, value), complete)
+        ctk.CTkButton(control_card, text='Применить режим', command=control, **primary).pack(anchor='w', padx=18, pady=(0, 4))
+        message.pack(fill='x', padx=18, pady=(0, 12))
+        advanced = ctk.CTkFrame(body, fg_color=COLOR_CARD, corner_radius=14,
+                                border_width=1, border_color=COLOR_BORDER)
+        def toggle_advanced():
+            if advanced.winfo_manager():
+                advanced.pack_forget()
+                advanced_button.configure(text='▶  Дополнительные настройки')
+            else:
+                advanced.pack(fill='x', padx=4, pady=(0, 8))
+                advanced_button.configure(text='▼  Дополнительные настройки')
+        advanced_button = ctk.CTkButton(body, text='▶  Дополнительные настройки',
+                                        command=toggle_advanced, anchor='w', **secondary)
+        advanced_button.pack(fill='x', padx=4, pady=(0, 8))
+        ctk.CTkLabel(advanced, text='Адрес контроллера (http://IP:порт); пусто — отключить', anchor='w',
+                     text_color=COLOR_MUTED, font=field_font).pack(fill='x', padx=18, pady=(14, 2))
+        endpoint = ctk.CTkEntry(advanced, **entry_style)
+        endpoint.pack(fill='x', padx=18)
+        endpoint.insert(0, self.fan_endpoint)
+        ctk.CTkButton(advanced, text='Сохранить адрес', command=save_endpoint, **secondary).pack(anchor='w', padx=18, pady=8)
+        ctk.CTkLabel(advanced, text='Настройки автоматики и датчиков', anchor='w',
+                     text_color=COLOR_MUTED, font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight='bold')).pack(fill='x', padx=18, pady=(8, 4))
+        self._fan_fields = {}
+        fields = [('stop_c', 'Температура остановки, °C'), ('start_c', 'Температура запуска, °C'),
+                  ('max_c', 'Температура максимальной мощности, °C'), ('delta_c', 'Улица холоднее минимум на, °C'),
+                  ('alarm_c', 'Температура аварии, °C'), ('min_power', 'Минимальная мощность, %'),
+                  ('max_power', 'Максимальная мощность, %'), ('room_rom', 'ROM датчика помещения'),
+                  ('outdoor_rom', 'ROM уличного датчика')]
+        def mark_dirty(_event):
+            self._fan_settings_dirty = True
+        for key, title in fields:
+            row = ctk.CTkFrame(advanced, fg_color='transparent')
+            row.pack(fill='x', padx=18, pady=3)
+            ctk.CTkLabel(row, text=title, anchor='w', width=260, text_color=COLOR_TEXT, font=field_font).pack(side='left')
+            entry = ctk.CTkEntry(row, **entry_style)
+            entry.pack(side='left', fill='x', expand=True)
+            entry.bind('<KeyRelease>', mark_dirty)
+            self._fan_fields[key] = entry
+        def reload_settings():
+            if not self.fan_status:
+                message.configure(text='Нет актуальных настроек контроллера')
+                return
+            self._fan_settings_dirty = False
+            self.update_fan_dialog()
+            message.configure(text='Показаны последние полученные настройки')
+        def save_settings():
+            try:
+                if not self.fan_status or not self._fan_settings_loaded:
+                    raise ValueError('Сначала получите актуальные настройки')
+                if status_settings(self.fan_status) != self._fan_settings_baseline:
+                    raise ValueError('Настройки изменились на контроллере; обновите форму')
+                payload = parse_settings_form({key: entry.get() for key, entry in self._fan_fields.items()})
+            except ValueError as exc:
+                message.configure(text=f'Ошибка: {exc}')
+                return
+            baseline = self._fan_settings_baseline.copy()
+            def save_if_unchanged(client):
+                latest = client.status()
+                if status_settings(latest) != baseline:
+                    raise ValueError('Настройки изменились на контроллере; обновите форму')
+                return client.settings(payload)
+            self.fan_request(save_if_unchanged, lambda ok, result: complete(ok, result, saved=True))
+        actions = ctk.CTkFrame(advanced, fg_color='transparent')
+        actions.pack(fill='x', padx=18, pady=(10, 16))
+        self._fan_save_button = ctk.CTkButton(actions, text='Сохранить настройки', command=save_settings, state='disabled', **primary)
+        self._fan_save_button.pack(side='left', padx=(0, 8))
+        ctk.CTkButton(actions, text='Обновить из контроллера', command=reload_settings, **secondary).pack(side='left')
+        self.update_fan_dialog()
+        window.update_idletasks()
+        window.lift()
+        window.focus_force()
+
+    def log_data_async(self, **values):
+        if self._closing:
+            return
+        # Queue state transitions too: a busy write must not discard OFFLINE.
+        with self._db_log_lock:
+            self._db_log_queue.put(values)
+            if self._db_log_busy:
+                return
+            self._db_log_busy = True
+        def worker():
+            while True:
+                with self._db_log_lock:
+                    if self._closing or self._db_log_queue.empty():
+                        self._db_log_busy = False
+                        return
+                    values = self._db_log_queue.get_nowait()
+                try:
+                    conn = get_db_conn()
+                    try:
+                        with conn:
+                            with conn.cursor() as cur:
+                                log_esp_data(cur, **values)
+                    finally:
+                        conn.close()
+                except Exception as exc:
+                    # A later sample opens a fresh connection, even after startup failure.
+                    print("DB log error:", exc)
         threading.Thread(target=worker, daemon=True).start()
 
     def parse_version(self, version):
@@ -708,7 +1095,9 @@ class ATSApp(ctk.CTk):
                             f.write(chunk)
 
             with zipfile.ZipFile(zip_path, 'r') as zf:
-                zf.testzip()
+                bad_file = zf.testzip()
+                if bad_file:
+                    raise RuntimeError(f"Повреждён файл в архиве: {bad_file}")
 
             # The updater must not run from app_dir: it needs to replace updater.exe too.
             staged_dir = os.path.join(tempfile.gettempdir(), "ATS_Monitor_updater")
@@ -811,10 +1200,11 @@ class ATSApp(ctk.CTk):
             return
         gadget = ctk.CTkToplevel(self)
         self.gadget = gadget
+        self._fan_animation_at = time.monotonic()
         gadget.title("АТС · Гаджет")
-        gadget.geometry("330x205")
-        gadget.minsize(330, 205)
-        gadget.maxsize(330, 205)
+        gadget.geometry("330x285")
+        gadget.minsize(330, 285)
+        gadget.maxsize(330, 285)
         gadget.resizable(False, False)
         gadget.attributes("-topmost", True)
         gadget.configure(fg_color=COLOR_BG)
@@ -831,11 +1221,20 @@ class ATSApp(ctk.CTk):
         self.gadget_door = ctk.CTkLabel(body, text="ДВЕРЬ: —", text_color=COLOR_MUTED,
                                         font=ctk.CTkFont(family=FONT_FAMILY, size=17, weight="bold"))
         self.gadget_door.pack(anchor="w", padx=16)
+        fan_row = ctk.CTkFrame(body, fg_color="transparent")
+        fan_row.pack(fill="x", padx=16)
+        icon_size = round(60 * fan_row._get_widget_scaling())
+        self.fan_canvas = ctk.CTkCanvas(fan_row, width=icon_size, height=icon_size, bg=COLOR_SURFACE, highlightthickness=0)
+        self.fan_canvas.pack(side="left")
+        self.fan_gadget_label = ctk.CTkLabel(fan_row, text="Вентиляция · нет связи", text_color=COLOR_MUTED,
+                                              font=ctk.CTkFont(family=FONT_FAMILY, size=11), justify="left", anchor="w")
+        self.fan_gadget_label.pack(side="left", padx=8)
         ctk.CTkButton(body, text="Открыть программу", width=150, height=26,
                       fg_color=COLOR_CARD_ALT, hover_color=COLOR_BORDER, text_color=COLOR_TEXT,
                       command=lambda: (self.deiconify(), self.lift())).pack(anchor="e", padx=14, pady=(1, 9))
         gadget.protocol("WM_DELETE_WINDOW", self.close_gadget)
         self.refresh_gadget()
+        self.animate_fan(gadget)
 
     def close_gadget(self):
         if self.gadget and self.gadget.winfo_exists():
@@ -895,138 +1294,146 @@ class ATSApp(ctk.CTk):
     def open_esp_selector(self):
         win = ctk.CTkToplevel(self)
         win.title("Подключение ESP")
-        win.geometry("520x450")
-        win.resizable(False, False)
-        win.attributes("-topmost", True)
+        win.geometry("560x540")
+        win.minsize(540, 520)
+        win.transient(self)
         win.configure(fg_color=COLOR_BG)
         body = ctk.CTkFrame(win, fg_color=COLOR_SURFACE, corner_radius=14, border_width=1, border_color=COLOR_BORDER)
         body.pack(fill="both", expand=True, padx=14, pady=14)
-
         stop_event = threading.Event()
-        found_ips = []
-        selected_ip = ctk.StringVar(value=ESP_IP or "")
-        ctk.CTkLabel(body, text="Подключение к ESP", text_color=COLOR_TEXT,
-                     font=ctk.CTkFont(family=FONT_FAMILY, size=20, weight="bold")).pack(anchor="w", padx=18, pady=(18, 2))
-        current_text = f"Текущий адрес: {ESP_IP or 'не выбран'}"
-        current_label = ctk.CTkLabel(body, text=current_text, text_color=COLOR_MUTED,
-                                     font=ctk.CTkFont(family=FONT_FAMILY, size=13))
-        current_label.pack(anchor="w", padx=18, pady=(0, 16))
-        ctk.CTkLabel(body, text="IP-адрес вручную", text_color=COLOR_MUTED,
-                     font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold")).pack(anchor="w", padx=18)
+        found = {}
+        choice = ctk.StringVar(value="")
+        address = ctk.StringVar(value="")
+        kind = ctk.StringVar(value="Датчик АТС")
+        ctk.CTkLabel(body, text="Подключение ESP", text_color=COLOR_TEXT,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=20, weight="bold")).pack(anchor="w", padx=18, pady=(16, 2))
+        ctk.CTkLabel(body, text="Датчик помещения и контроллер вентиляции", text_color=COLOR_MUTED,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=12)).pack(anchor="w", padx=18, pady=(0, 10))
+        current_card = ctk.CTkFrame(body, fg_color=COLOR_CARD_ALT, corner_radius=10)
+        current_card.pack(fill="x", padx=18, pady=(0, 12))
+        ctk.CTkLabel(current_card, text="ТЕКУЩИЕ ПОДКЛЮЧЕНИЯ", text_color=COLOR_MUTED,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold")).pack(anchor="w", padx=12, pady=(8, 0))
+        current = ctk.CTkLabel(current_card, text="", text_color=COLOR_TEXT, justify="left", anchor="w",
+                               font=ctk.CTkFont(family=FONT_FAMILY, size=12))
+        current.pack(fill="x", padx=12, pady=(0, 8))
+        def refresh_current():
+            current.configure(text=f"Датчик АТС: {ESP_IP or 'не выбран'}\nВентилятор: {self.fan_endpoint or 'не выбран'}")
+        refresh_current()
+        ctk.CTkLabel(body, text="Подключить по адресу", text_color=COLOR_TEXT,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold")).pack(anchor="w", padx=18)
         row = ctk.CTkFrame(body, fg_color="transparent")
-        row.pack(fill="x", padx=18, pady=(4, 12))
-        ip_entry = ctk.CTkEntry(row, textvariable=selected_ip, height=34, placeholder_text="192.168.88.30",
-                                fg_color=COLOR_CARD_ALT, border_color=COLOR_BORDER, text_color=COLOR_TEXT)
-        ip_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ctk.CTkButton(row, text="Подключить", width=105, height=34, command=lambda: save_and_use(ip_entry.get()),
-                      fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER).pack(side="right")
-        status_label = ctk.CTkLabel(body, text="Поиск ещё не запущен", text_color=COLOR_MUTED,
-                                    font=ctk.CTkFont(family=FONT_FAMILY, size=12))
-        status_label.pack(anchor="w", padx=18, pady=(0, 4))
+        row.pack(fill="x", padx=18, pady=(4, 8))
+        ctk.CTkOptionMenu(row, variable=kind, values=["Датчик АТС", "Вентилятор"], width=145,
+                          height=32, corner_radius=8, fg_color=COLOR_CARD_ALT, button_color=COLOR_BORDER,
+                          button_hover_color=COLOR_ACCENT, text_color=COLOR_TEXT).pack(side="left", padx=(0, 8))
+        ctk.CTkEntry(row, textvariable=address, placeholder_text="IP или адрес:порт", height=32,
+                     corner_radius=8, border_color=COLOR_BORDER).pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(body, text="Поиск в сети", text_color=COLOR_TEXT,
+                     font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold")).pack(anchor="w", padx=18)
+        status = ctk.CTkLabel(body, text="Поиск ещё не запущен", text_color=COLOR_MUTED,
+                              font=ctk.CTkFont(family=FONT_FAMILY, size=12))
+        status.pack(anchor="w", padx=18, pady=(8, 4))
         progress = ctk.CTkProgressBar(body, height=8, progress_color=COLOR_ACCENT, fg_color=COLOR_CARD_ALT)
         progress.set(0)
         progress.pack(fill="x", padx=18, pady=(0, 12))
-        ctk.CTkLabel(body, text="Найденные устройства", text_color=COLOR_MUTED,
-                     font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold")).pack(anchor="w", padx=18)
-        devices_frame = ctk.CTkFrame(body, fg_color=COLOR_CARD_ALT, corner_radius=10)
-        devices_frame.pack(fill="x", padx=18, pady=(4, 14))
-        devices_combo = ctk.CTkComboBox(devices_frame, values=["Пока ничего не найдено"], variable=selected_ip,
-                                        width=300, height=34, state="readonly", fg_color=COLOR_SURFACE,
-                                        border_color=COLOR_BORDER, button_color=COLOR_ACCENT, dropdown_fg_color=COLOR_SURFACE,
-                                        text_color=COLOR_TEXT)
-        devices_combo.pack(side="left", fill="x", expand=True, padx=8, pady=8)
-
-        scan_btn = None
-
-        def save_and_use(ip):
-            ip = ip.strip()
+        combo = ctk.CTkComboBox(body, values=["Пока ничего не найдено"], variable=choice, state="readonly",
+                                height=32, corner_radius=8, border_color=COLOR_BORDER,
+                                button_color=COLOR_CARD_ALT, button_hover_color=COLOR_BORDER,
+                                text_color=COLOR_TEXT, font=ctk.CTkFont(family=FONT_FAMILY, size=12))
+        combo.pack(fill="x", padx=18, pady=4)
+        def save_device(device_kind, ip):
+            if device_kind == 'sensor':
+                with open(ESP_CONFIG, 'w', encoding='utf-8') as f:
+                    f.write(ip)
+                set_esp_ip(ip)
+                self.update_label.configure(text=f"ESP: {ip}")
+            else:
+                endpoint = normalize_endpoint(ip)
+                os.makedirs(os.path.dirname(self.fan_endpoint_file), exist_ok=True)
+                with open(self.fan_endpoint_file, 'w', encoding='utf-8') as f:
+                    f.write(endpoint)
+                self.fan_endpoint = endpoint
+                self._fan_generation += 1
+                self.fan_status = None
+                self.update_fan_dialog()
+            refresh_current()
+            status.configure(text="Адрес сохранён; соединение восстанавливается автоматически", text_color=COLOR_SUCCESS)
+        def connect():
+            ip = address.get().strip()
+            expected = 'sensor' if kind.get() == 'Датчик АТС' else 'fan'
             if not ip:
-                status_label.configure(text="Введите IP или дождитесь поиска", text_color=COLOR_WARNING)
+                status.configure(text="Введите адрес", text_color=COLOR_WARNING)
                 return
-
-            set_esp_ip(ip)
-            with open(ESP_CONFIG, "w", encoding="utf-8") as f:
-                f.write(ip)
-
-            status_label.configure(text=f"Используется {ip}", text_color=COLOR_SUCCESS)
-            self.update_label.configure(text=f"ESP: {ip}")
-            win.after(350, win.destroy)
-
-        # Ручной адрес подключается основной кнопкой в этой строке.
-
-        def add_found_ip(ip):
-            if ip not in found_ips:
-                found_ips.append(ip)
-                devices_combo.configure(values=found_ips)
-                selected_ip.set(ip)
-
-        def do_scan():
-            nonlocal scan_btn
-            stop_event.clear()
-            found_ips.clear()
-            devices_combo.configure(values=["Поиск..."])
-            selected_ip.set(ESP_IP or "")
-            progress.set(0)
-            status_label.configure(text="Быстрый поиск: последний IP, ats-room.local, затем подсеть...", text_color=COLOR_MUTED)
-            if scan_btn:
-                scan_btn.configure(state="disabled", text="Ищу...")
-
-            def progress_cb(done, total, ip, ok):
-                def update_progress():
-                    if not win.winfo_exists():
-                        return
-                    progress.set(done / total if total else 0)
-                    if ok:
-                        status_label.configure(text=f"Найдена ESP: {ip}", text_color=COLOR_SUCCESS)
-                        add_found_ip(ip)
-                    else:
-                        status_label.configure(text=f"Проверяю {ip}  ({done}/{total})", text_color=COLOR_MUTED)
-                self.safe_after_from_worker(update_progress)
-
+            status.configure(text="Проверяю тип устройства...", text_color=COLOR_MUTED)
             def worker():
-                devices = scan_for_esp(progress_cb=progress_cb, stop_event=stop_event)
-
+                devices = probe_esp_devices(ip, timeout=1.5)
                 def finish():
                     if not win.winfo_exists():
                         return
-                    if scan_btn:
-                        scan_btn.configure(state="normal", text="Сканировать")
-                    progress.set(1)
-                    if devices:
-                        for ip in devices:
-                            add_found_ip(ip)
-                        status_label.configure(text=f"Найдена ESP: {devices[0]}", text_color=COLOR_SUCCESS)
-                        save_and_use(devices[0])
-                    else:
-                        devices_combo.configure(values=["Не найдено"])
-                        status_label.configure(
-                            text="ESP не найдена. Можно ввести IP вручную.",
-                            text_color=COLOR_WARNING
-                        )
-
+                    if (expected, ip) not in devices:
+                        status.configure(text="Устройство этого типа не отвечает по указанному адресу", text_color=COLOR_WARNING)
+                        return
+                    try:
+                        save_device(expected, ip)
+                    except (OSError, ValueError) as exc:
+                        status.configure(text=f"Не удалось сохранить адрес: {exc}", text_color=COLOR_WARNING)
                 self.safe_after_from_worker(finish)
-
             threading.Thread(target=worker, daemon=True).start()
-
-        def on_close():
+        ctk.CTkButton(row, text="Подключить", command=connect, width=100, height=32, corner_radius=8,
+                      fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER).pack(side="right", padx=(8, 0))
+        def select_found():
+            device = found.get(choice.get())
+            if device:
+                device_kind, ip = device
+                kind.set("Датчик АТС" if device_kind == 'sensor' else "Вентилятор")
+                address.set(ip)
+                connect()
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
+        buttons.pack(fill="x", padx=18, pady=12)
+        scan_btn = ctk.CTkButton(buttons, text="Сканировать", width=120, height=32, corner_radius=8,
+                                 fg_color=COLOR_CARD_ALT, hover_color=COLOR_BORDER, text_color=COLOR_TEXT,
+                                 command=lambda: scan())
+        scan_btn.pack(side="left")
+        ctk.CTkButton(buttons, text="Подключить выбранное", command=select_found, height=32, corner_radius=8,
+                      fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER).pack(side="right")
+        def scan():
+            stop_event.clear()
+            found.clear()
+            choice.set("")
+            combo.configure(values=["Поиск..."])
+            progress.set(0)
+            scan_btn.configure(state="disabled")
+            status.configure(text="Поиск датчика и вентилятора...", text_color=COLOR_MUTED)
+            def progress_cb(done, total, ip, devices):
+                def update():
+                    if not win.winfo_exists():
+                        return
+                    progress.set(done / total if total else 1)
+                    for device_kind, host in devices:
+                        label = f"{'Датчик АТС' if device_kind == 'sensor' else 'Вентилятор'} — {host}"
+                        found[label] = (device_kind, host)
+                    if found:
+                        combo.configure(values=list(found))
+                        if not choice.get():
+                            choice.set(next(iter(found)))
+                    status.configure(text=f"Проверено {done}/{total}; найдено {len(found)}", text_color=COLOR_MUTED)
+                self.safe_after_from_worker(update)
+            def worker():
+                scan_for_devices(progress_cb=progress_cb, stop_event=stop_event, fan_endpoint=self.fan_endpoint)
+                def finish():
+                    if win.winfo_exists():
+                        scan_btn.configure(state="normal")
+                        status.configure(text=f"Поиск завершён; найдено {len(found)}", text_color=COLOR_SUCCESS if found else COLOR_WARNING)
+                self.safe_after_from_worker(finish)
+            threading.Thread(target=worker, daemon=True).start()
+        def close():
             stop_event.set()
             win.destroy()
-
-        btn_frame = ctk.CTkFrame(body, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=18, pady=(0, 16))
-        scan_btn = ctk.CTkButton(btn_frame, text="Сканировать", width=115, height=34, command=do_scan,
-                                 fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER)
-        scan_btn.pack(side="left")
-        ctk.CTkButton(btn_frame, text="Использовать выбранный", width=160, height=34,
-                      command=lambda: save_and_use(selected_ip.get()), fg_color=COLOR_CARD_ALT,
-                      hover_color=COLOR_BORDER, text_color=COLOR_TEXT).pack(side="right")
-
-        win.protocol("WM_DELETE_WINDOW", on_close)
-        do_scan()
-
+        win.protocol("WM_DELETE_WINDOW", close)
+        scan()
 
     def loop(self):
-        global outside_temp, last_weather_update, season_mode
+        global outside_temp, season_mode
 
         # Сетевые запросы выполняются в worker-потоках: главный поток только рисует UI.
         now = time.time()
@@ -1034,29 +1441,26 @@ class ATSApp(ctk.CTk):
             self._esp_refresh_running = True
 
             def read_esp():
+                endpoint = ESP_URL
                 data = get_esp_data()
+                completed_at = time.monotonic()
                 def apply_esp():
+                    if endpoint != ESP_URL:
+                        self._esp_refresh_running = False
+                        return
                     self._latest_esp = data
-                    self._latest_esp_at = time.time() if data else self._latest_esp_at
+                    self._latest_esp_at = completed_at if data else self._latest_esp_at
                     self._esp_refresh_running = False
                 self.safe_after_from_worker(apply_esp)
             threading.Thread(target=read_esp, daemon=True).start()
 
-        if now - last_weather_update > 900 and not self._weather_refresh_running:
-            self._weather_refresh_running = True
+        fan_fresh = self._fan_last_poll_at and time.monotonic() - self._fan_last_poll_at <= 12
+        outside_temp = outdoor_from_fan(self.fan_status if fan_fresh else None)
+        season_mode = detect_season(outside_temp, season_mode)
 
-            def read_weather():
-                value = get_outside_temp()
-                def apply_weather():
-                    global outside_temp, last_weather_update, season_mode
-                    outside_temp = value
-                    season_mode = detect_season(outside_temp, season_mode)
-                    last_weather_update = time.time()
-                    self._weather_refresh_running = False
-                self.safe_after_from_worker(apply_weather)
-            threading.Thread(target=read_weather, daemon=True).start()
-
-        esp = self._latest_esp
+        esp = validated_esp(self._latest_esp)
+        if time.monotonic() - self._latest_esp_at > self.ESP_TIMEOUT:
+            esp = None
 
         if esp:
             self.last_esp_seen = now
@@ -1069,7 +1473,7 @@ class ATSApp(ctk.CTk):
             d = bool(esp.get("door", False))
 
             self.room_label.configure(
-                text=f"Температура: {t:.1f} °C     Улица: {outside_temp if outside_temp is not None else '--'} °C\n"
+                text=f"Температура: {t:.1f} °C     Улица: {f'{outside_temp:.1f}' if outside_temp is not None else '--'} °C\n"
                      f"Влажность: {h:.0f} %     Давление: {p:.0f} мм"
             )
             self.status_label.configure(text=f"ESP: ONLINE\nРежим: {season_mode}", text_color=COLOR_SUCCESS)
@@ -1094,49 +1498,28 @@ class ATSApp(ctk.CTk):
             )
 
             # ✅ логирование с троттлингом
-            if self.db_conn and self.db_cursor and now - self.last_logged >= self.LOG_INTERVAL:
-                try:
-                    with self.db_lock:
-                        log_esp_data(
-                            self.db_cursor,
-                            temp=t,
-                            hum=h,
-                            press=p,
-                            door=d,
-                            online=True
-                        )
-                        self.db_conn.commit()
-                    self.last_logged = now
-                except Exception as e:
-                    print("DB log error:", e)
-                
+            if getattr(self, "_db_enabled", False) and now - self.last_logged >= self.LOG_INTERVAL:
+                self.log_data_async(temp=t, hum=h, press=p, door=d, online=True)
+                self.last_logged = now
+
             if was_offline:
                 print("ESP снова ONLINE")
 
         else:
+            check_alerts(None, None, None, "—")
             if self.esp_online and now - self.last_esp_seen > self.ESP_TIMEOUT:
                 self.esp_online = False
                 print("ESP OFFLINE")
 
-                if self.db_conn and self.db_cursor:
-                    try:
-                        with self.db_lock:
-                            log_esp_data(
-                                self.db_cursor,
-                                temp=None,
-                                hum=None,
-                                press=None,
-                                door=None,
-                                online=False
-                            )
-                            self.db_conn.commit()
-                    except Exception as e:
-                        print("DB offline log error:", e)
+                if getattr(self, "_db_enabled", False):
+                    self.log_data_async(temp=None, hum=None, press=None, door=None, online=False)
 
             if not self.esp_online:
+                outdoor_text = f"{outside_temp:.1f}" if outside_temp is not None else "--"
+                self.room_label.configure(text=f"Температура: --.- °C     Улица: {outdoor_text} °C\nВлажность: -- %     Давление: ---- мм")
                 self.door_state_label.configure(text="ДВЕРЬ: НЕТ ДАННЫХ", text_color=COLOR_MUTED)
                 self.status_frame.configure(border_color=COLOR_BORDER)
-                self.status_label.configure(text="ESP: OFFLINE\nРежим: —", text_color=COLOR_DANGER)
+                self.status_label.configure(text=f"ESP: OFFLINE\nРежим: {season_mode}", text_color=COLOR_DANGER)
                 self.refresh_gadget(online=False)
                 self.update_label.configure(text="нет связи с ESP")
 
@@ -1200,7 +1583,9 @@ class ATSApp(ctk.CTk):
         if self.camera_reader:
             self.camera_reader.stop()
         self.camera_reader = CameraReader(rtsp_url)
-        self.schedule_after(150, self.update_camera)
+        if not getattr(self, "_camera_updates_started", False):
+            self._camera_updates_started = True
+            self.schedule_after(150, self.update_camera)
         
     def update_camera(self):
         frame = self.camera_reader.latest_frame() if self.camera_reader else None
@@ -1218,6 +1603,8 @@ class ATSApp(ctk.CTk):
             img = ctk.CTkImage(light_image=Image.fromarray(frame), size=(target_w, target_h))
             self.cam_canvas.ctk_image = img
             self.cam_canvas.configure(image=img, text="")
+        else:
+            self.cam_canvas.configure(image=None, text="Камера не подключена")
         if not self._closing and self.camera_reader:
             self.schedule_after(80, self.update_camera)
     def open_camera_window(self):
@@ -1231,8 +1618,10 @@ class ATSApp(ctk.CTk):
         win.resizable(True, True)
         win.attributes("-topmost", True)
 
-        cam_view = ctk.CTkLabel(win, text="", fg_color="black")
-        cam_view.configure(text="")
+        # Native Tk uses physical pixels, matching winfo_width/height and PhotoImage.
+        # CTkImage would apply DPI scaling a second time to these dimensions.
+        from tkinter import Label
+        cam_view = Label(win, text="", bg="black", borderwidth=0, highlightthickness=0)
         cam_view.pack(fill="both", expand=True)
 
         def update_big():
@@ -1248,9 +1637,12 @@ class ATSApp(ctk.CTk):
                 scale = min(1.0, view_w / src_w, view_h / src_h)
                 scaled_w, scaled_h = max(1, round(src_w * scale)), max(1, round(src_h * scale))
                 frame = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
-                img = ctk.CTkImage(light_image=Image.fromarray(frame), size=(scaled_w, scaled_h))
-                cam_view.ctk_image = img
-                cam_view.configure(width=view_w, height=view_h, image=img, text="")
+                img = ImageTk.PhotoImage(Image.fromarray(frame))
+                cam_view.camera_image = img
+                cam_view.configure(image=img, text="")
+            else:
+                cam_view.configure(image="", text="Камера не подключена", fg="white")
+                cam_view.camera_image = None
             self.schedule_after(40, update_big)
 
         update_big()
@@ -1335,32 +1727,35 @@ class ATSApp(ctk.CTk):
         table.pack(fill="x", padx=10, pady=(6, 10))
 
         # ===== ЛОГИКА =====
+        history_generation = 0
         def load_data():
-            for i in table.get_children():
-                table.delete(i)
-
-            try:
-                frm = date_from.get()
-                to = date_to.get()
-
-                if not self.db_conn:
-                    print("History error: DB is not connected")
+            nonlocal history_generation
+            history_generation += 1
+            generation = history_generation
+            frm, to = date_from.get(), date_to.get()
+            def worker():
+                try:
+                    conn = get_db_conn()
+                    try:
+                        with conn:
+                            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                                cur.execute("""SELECT ts, temperature, humidity, door_open
+                                    FROM esp_log WHERE ts BETWEEN %s AND %s ORDER BY ts""", (frm, to))
+                                rows = cur.fetchall()
+                    finally:
+                        conn.close()
+                except Exception as exc:
+                    print("History error:", exc)
                     return
+                def apply():
+                    if win.winfo_exists() and generation == history_generation:
+                        render_data(rows)
+                self.safe_after_from_worker(apply)
+            threading.Thread(target=worker, daemon=True).start()
 
-                with self.db_lock:
-                    cur = self.db_conn.cursor(cursor_factory=RealDictCursor)
-                    cur.execute("""
-                        SELECT ts, temperature, humidity, door_open
-                        FROM esp_log
-                        WHERE ts BETWEEN %s AND %s
-                        ORDER BY ts
-                    """, (frm, to))
-                    rows = cur.fetchall()
-                    cur.close()
-            except Exception as e:
-                print("History error:", e)
-                return
-
+        def render_data(rows):
+            for item_id in table.get_children():
+                table.delete(item_id)
             if not rows:
                 ax.clear()
                 ax.text(0.5, 0.5, "Нет данных за выбранный период", ha="center", va="center")
@@ -1368,8 +1763,8 @@ class ATSApp(ctk.CTk):
                 return
 
             times = [r["ts"] for r in rows]
-            temps = [r["temperature"] for r in rows]
-            hums = [r["humidity"] for r in rows]
+            temps = [float(r["temperature"]) if r["temperature"] is not None else float("nan") for r in rows]
+            hums = [float(r["humidity"]) if r["humidity"] is not None else float("nan") for r in rows]
 
             ax.clear()
             ax.set_facecolor(COLOR_CARD_ALT)
@@ -1392,9 +1787,9 @@ class ATSApp(ctk.CTk):
                     "", "end",
                     values=(
                         r["ts"].strftime("%d.%m.%Y  %H:%M"),
-                        f"{r['temperature']:.1f} °C",
-                        f"{r['humidity']:.0f} %",
-                        "ОТКРЫТА" if door_open else "ЗАКРЫТА",
+                        f"{r['temperature']:.1f} °C" if r["temperature"] is not None else "—",
+                        f"{r['humidity']:.0f} %" if r["humidity"] is not None else "—",
+                        ("ОТКРЫТА" if door_open else "ЗАКРЫТА") if r["door_open"] is not None else "—",
                     ),
                     tags=("door_open" if door_open else "door_closed",),
                 )
@@ -1493,7 +1888,7 @@ class AlertManager:
         win = AlertWindow(
             title,
             message,
-            sound_file=os.path.join(BASE_DIR, "sounds", "winter_vent.wav")
+            sound_file=os.path.join(BASE_DIR, "sounds", "alert.wav")
         )
         self.alerts[key] = win
 
